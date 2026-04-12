@@ -2,13 +2,9 @@
 
 Automatic secondary DNS zone management for CyberPanel servers.
 
-## Features
+## How It Works
 
-- Auto-add zones when domains are created in CyberPanel
-- Auto-remove zones when domains are deleted
-- Periodic sync (cron) to catch any missed changes
-- Manual CLI for add/remove/sync/list
-- Auto-detects server public IP as master
+Hooks into CyberPanel's Django signal system (`postWebsiteCreation`, `postWebsiteDeletion`). When a domain is created or deleted in CyberPanel, the secondary DNS zone is instantly added or removed via API. No polling, no delays.
 
 ## Quick Install
 
@@ -18,13 +14,19 @@ cd dns_integrations/cyberpanel
 sudo bash install.sh
 ```
 
-Then edit `/etc/seconddns.conf`:
+Edit `/etc/seconddns.conf`:
 
 ```ini
 [seconddns]
 api_url = https://seconddns.com
 api_key = YOUR_API_KEY_HERE
 master_ip =
+```
+
+Run initial sync:
+
+```bash
+seconddns sync
 ```
 
 ## Usage
@@ -36,10 +38,8 @@ seconddns sync
 # List zones on secondary DNS
 seconddns list
 
-# Manually add a domain
+# Manually add/remove
 seconddns add example.com
-
-# Manually remove a domain
 seconddns remove example.com
 ```
 
@@ -47,11 +47,12 @@ seconddns remove example.com
 
 | File | Purpose |
 |---|---|
-| `/usr/local/bin/seconddns` | Main CLI script |
+| `/usr/local/bin/seconddns` | CLI script |
 | `/etc/seconddns.conf` | Configuration (API key, URL) |
-| `/etc/cron.d/seconddns-sync` | Periodic sync every 6 hours |
-| `/usr/local/CyberCP/hooks/post_domain_create.sh` | Auto-add hook |
-| `/usr/local/CyberCP/hooks/post_domain_delete.sh` | Auto-remove hook |
+| `/usr/local/CyberCP/plogical/seconddns_plugin.py` | Django signal handlers |
+| `/var/log/seconddns.log` | Log file |
+
+The installer also registers signal handlers in CyberPanel's startup (`ready.py`).
 
 ## Logs
 
@@ -63,15 +64,15 @@ tail -f /var/log/seconddns.log
 
 ```bash
 sudo rm /usr/local/bin/seconddns
-sudo rm /etc/cron.d/seconddns-sync
-sudo rm /usr/local/CyberCP/hooks/post_domain_create.sh
-sudo rm /usr/local/CyberCP/hooks/post_domain_delete.sh
+sudo rm /usr/local/CyberCP/plogical/seconddns_plugin.py
+# Remove the seconddns block from /usr/local/CyberCP/CyberCP/ready.py
+sudo systemctl restart lscpd
 # Optionally: sudo rm /etc/seconddns.conf
 ```
 
 ## Requirements
 
-- Python 3.6+
-- CyberPanel installed
+- Python 3.6+ (ships with CyberPanel)
+- CyberPanel 2.x+
 - Network access to secondary DNS API
-- Primary DNS (BIND/PowerDNS) configured to allow AXFR from secondary DNS server IP
+- Primary DNS configured to allow AXFR from secondary DNS server IP

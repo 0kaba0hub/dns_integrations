@@ -3,66 +3,87 @@ set -e
 
 INSTALL_DIR="/usr/local/bin"
 CONFIG_FILE="/etc/seconddns.conf"
-HOOK_DIR="/usr/local/CyberCP/postfixSenderPolicy"
-CRON_FILE="/etc/cron.d/seconddns-sync"
+CYBERPANEL_DIR="/usr/local/CyberCP"
+PLUGIN_FILE="$CYBERPANEL_DIR/plogical/seconddns_plugin.py"
+READY_FILE="$CYBERPANEL_DIR/CyberCP/ready.py"
 
-echo "=== SecondDNS CyberPanel Integration Installer ==="
+echo "=== SecondDNS CyberPanel Integration ==="
 echo ""
 
-# Copy main script
+# Copy CLI script
 cp seconddns.py "$INSTALL_DIR/seconddns"
 chmod +x "$INSTALL_DIR/seconddns"
-echo "[+] Installed seconddns to $INSTALL_DIR/seconddns"
+echo "[+] Installed CLI to $INSTALL_DIR/seconddns"
 
 # Config
 if [ ! -f "$CONFIG_FILE" ]; then
     cp seconddns.conf.example "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
     echo "[+] Created config at $CONFIG_FILE"
-    echo "    → Edit $CONFIG_FILE and set your api_url and api_key"
+    echo "    Edit it and set your api_url and api_key"
 else
-    echo "[=] Config already exists at $CONFIG_FILE, skipping"
+    echo "[=] Config already exists at $CONFIG_FILE"
 fi
 
-# CyberPanel post-create hook
-if [ -d "/usr/local/CyberCP" ]; then
-    mkdir -p /usr/local/CyberCP/hooks
-    cat > /usr/local/CyberCP/hooks/post_domain_create.sh << 'HOOK'
-#!/bin/bash
-# Called by CyberPanel after domain creation
-# $1 = domain name
-if [ -x /usr/local/bin/seconddns ]; then
-    /usr/local/bin/seconddns add "$1" >> /var/log/seconddns.log 2>&1 &
-fi
+# Log dir
+mkdir -p /var/lib/seconddns
+touch /var/log/seconddns.log
+echo "[+] Created log file /var/log/seconddns.log"
+
+# Install Django signal plugin into CyberPanel
+if [ -d "$CYBERPANEL_DIR" ]; then
+    cp seconddns.py "$PLUGIN_FILE"
+    echo "[+] Installed plugin to $PLUGIN_FILE"
+
+    # Register signals on CyberPanel startup via ready.py
+    if [ -f "$READY_FILE" ]; then
+        if ! grep -q "seconddns_plugin" "$READY_FILE"; then
+            cat >> "$READY_FILE" << 'HOOK'
+
+# SecondDNS integration — register domain create/delete signals
+try:
+    from plogical.seconddns_plugin import register_signals, setup_logging
+    setup_logging()
+    register_signals()
+except Exception as e:
+    import logging
+    logging.getLogger("seconddns").error("Failed to register signals: %s", e)
 HOOK
-    chmod +x /usr/local/CyberCP/hooks/post_domain_create.sh
+            echo "[+] Registered signals in CyberPanel startup"
+        else
+            echo "[=] Signals already registered in CyberPanel"
+        fi
+    else
+        echo "[!] $READY_FILE not found — signals must be registered manually"
+        echo "    Add this to CyberPanel startup:"
+        echo "      from plogical.seconddns_plugin import register_signals, setup_logging"
+        echo "      setup_logging(); register_signals()"
+    fi
 
-    cat > /usr/local/CyberCP/hooks/post_domain_delete.sh << 'HOOK'
-#!/bin/bash
-# Called by CyberPanel after domain deletion
-# $1 = domain name
-if [ -x /usr/local/bin/seconddns ]; then
-    /usr/local/bin/seconddns remove "$1" >> /var/log/seconddns.log 2>&1 &
+    # Restart CyberPanel to load signals
+    echo ""
+    read -p "Restart CyberPanel (lscpd) to activate? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        systemctl restart lscpd
+        echo "[+] CyberPanel restarted"
+    fi
+else
+    echo "[!] CyberPanel not found at $CYBERPANEL_DIR"
+    echo "    Plugin signals not installed — use CLI commands instead"
 fi
-HOOK
-    chmod +x /usr/local/CyberCP/hooks/post_domain_delete.sh
-    echo "[+] Installed CyberPanel hooks"
-fi
-
-# Cron job for periodic sync (every 6 hours)
-cat > "$CRON_FILE" << 'CRON'
-# Sync CyberPanel domains with secondary DNS service
-0 */6 * * * root /usr/local/bin/seconddns sync >> /var/log/seconddns.log 2>&1
-CRON
-chmod 644 "$CRON_FILE"
-echo "[+] Installed cron job (sync every 6 hours)"
 
 echo ""
-echo "=== Installation complete ==="
+echo "=== Done ==="
 echo ""
-echo "Next steps:"
-echo "  1. Edit $CONFIG_FILE — set your api_url and api_key"
-echo "  2. Run: seconddns sync — to sync existing domains"
-echo "  3. Run: seconddns list — to verify zones"
+echo "How it works:"
+echo "  Domains created/deleted in CyberPanel are automatically"
+echo "  synced to your secondary DNS service via Django signals."
 echo ""
-echo "Logs: /var/log/seconddns.log"
+echo "CLI commands (for manual use):"
+echo "  seconddns sync      — full sync of all domains"
+echo "  seconddns list      — show zones on secondary DNS"
+echo "  seconddns add X     — add domain manually"
+echo "  seconddns remove X  — remove domain manually"
+echo ""
+echo "Logs: tail -f /var/log/seconddns.log"

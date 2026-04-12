@@ -2,16 +2,17 @@
 """
 CyberPanel integration for secondary DNS service.
 
-Modes:
-  add <domain>       — Register domain as secondary zone
-  remove <domain>    — Remove domain from secondary DNS
-  sync               — Sync all CyberPanel domains with secondary DNS
-  list               — List zones on secondary DNS
+Works in two modes:
+  1. Django signal plugin — hooks into CyberPanel's postWebsiteCreation/Deletion signals
+  2. CLI — manual add/remove/sync/list commands
 
-Configuration via /etc/seconddns.conf or environment variables:
-  SECONDDNS_API_URL  — API base URL (e.g. https://seconddns.com)
-  SECONDDNS_API_KEY  — API key from dashboard
-  SECONDDNS_MASTER_IP — Primary DNS server IP (auto-detected if not set)
+CLI usage:
+  seconddns add <domain>       — Register domain as secondary zone
+  seconddns remove <domain>    — Remove domain from secondary DNS
+  seconddns sync               — Sync all CyberPanel domains with secondary DNS
+  seconddns list               — List zones on secondary DNS
+
+Configuration: /etc/seconddns.conf
 """
 
 import json
@@ -22,13 +23,25 @@ import subprocess
 import urllib.request
 import urllib.error
 import configparser
+import logging
 
 CONFIG_FILE = "/etc/seconddns.conf"
+LOG_FILE = "/var/log/seconddns.log"
+
+logger = logging.getLogger("seconddns")
+
+
+def setup_logging():
+    handler = logging.FileHandler(LOG_FILE)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.addHandler(logging.StreamHandler())
+    logger.setLevel(logging.INFO)
+
 
 def load_config():
     config = {}
 
-    # Load from config file
     if os.path.exists(CONFIG_FILE):
         cp = configparser.ConfigParser()
         cp.read(CONFIG_FILE)
@@ -37,17 +50,14 @@ def load_config():
             config["api_key"] = cp.get("seconddns", "api_key", fallback="")
             config["master_ip"] = cp.get("seconddns", "master_ip", fallback="")
 
-    # Environment overrides
     config["api_url"] = os.environ.get("SECONDDNS_API_URL", config.get("api_url", "")).rstrip("/")
     config["api_key"] = os.environ.get("SECONDDNS_API_KEY", config.get("api_key", ""))
     config["master_ip"] = os.environ.get("SECONDDNS_MASTER_IP", config.get("master_ip", ""))
 
     if not config["api_url"] or not config["api_key"]:
-        print("Error: SECONDDNS_API_URL and SECONDDNS_API_KEY are required.", file=sys.stderr)
-        print(f"Set them in {CONFIG_FILE} or as environment variables.", file=sys.stderr)
-        sys.exit(1)
+        logger.error("SECONDDNS_API_URL and SECONDDNS_API_KEY are required. Set them in %s", CONFIG_FILE)
+        return None
 
-    # Auto-detect master IP if not set
     if not config["master_ip"]:
         config["master_ip"] = detect_master_ip()
 
@@ -55,7 +65,6 @@ def load_config():
 
 
 def detect_master_ip():
-    """Detect the server's public IPv4 address."""
     try:
         resp = urllib.request.urlopen("https://api.ipify.org", timeout=5)
         return resp.read().decode().strip()
@@ -67,12 +76,11 @@ def detect_master_ip():
             s.close()
             return ip
         except Exception:
-            print("Error: Could not detect master IP. Set SECONDDNS_MASTER_IP.", file=sys.stderr)
-            sys.exit(1)
+            logger.error("Could not detect master IP. Set SECONDDNS_MASTER_IP.")
+            return None
 
 
 def api_request(config, method, path, data=None):
-    """Make an API request to the secondary DNS service."""
     url = f"{config['api_url']}{path}"
     headers = {
         "X-API-Key": config["api_key"],
@@ -94,18 +102,18 @@ def api_request(config, method, path, data=None):
 
 
 def list_zones(config):
-    """List all zones on the secondary DNS service."""
     result = api_request(config, "GET", "/api/zones")
     if isinstance(result, list):
         return result
-    print(f"Error listing zones: {result}", file=sys.stderr)
+    logger.error("Error listing zones: %s", result)
     return []
 
 
 def add_zone(config, domain):
-    """Add a domain to the secondary DNS service."""
     domain = domain.lower().rstrip(".")
-    print(f"Adding zone: {domain} (master: {config['master_ip']})")
+    if not config or not config.get("master_ip"):
+        return False
+    logger.info("[+] Adding zone: %s (master: %s)", domain, config["master_ip"])
     result = api_request(config, "POST", "/api/zones", {
         "name": domain,
         "masterIp": config["master_ip"],
@@ -114,35 +122,31 @@ def add_zone(config, domain):
         status = result["_status"]
         error = result.get("error", "Unknown error")
         if status == 409:
-            print(f"  Zone {domain} already exists, skipping.")
-        elif status == 403:
-            print(f"  Error: {error} (zone limit reached?)", file=sys.stderr)
+            logger.info("    Already exists, skipping.")
         else:
-            print(f"  Error ({status}): {error}", file=sys.stderr)
+            logger.error("    Error (%s): %s", status, error)
         return False
-    print(f"  Zone {domain} added successfully.")
+    logger.info("    Done.")
     return True
 
 
 def remove_zone(config, domain):
-    """Remove a domain from the secondary DNS service."""
     domain = domain.lower().rstrip(".")
     zones = list_zones(config)
     zone = next((z for z in zones if z["name"].rstrip(".") == domain), None)
     if not zone:
-        print(f"  Zone {domain} not found on secondary DNS.")
+        logger.info("[-] Zone %s not found on secondary DNS.", domain)
         return False
-    print(f"Removing zone: {domain}")
+    logger.info("[-] Removing zone: %s", domain)
     result = api_request(config, "DELETE", f"/api/zones/{zone['id']}")
     if result and result.get("_status"):
-        print(f"  Error: {result.get('error', 'Unknown')}", file=sys.stderr)
+        logger.error("    Error: %s", result.get("error", "Unknown"))
         return False
-    print(f"  Zone {domain} removed successfully.")
+    logger.info("    Done.")
     return True
 
 
 def get_cyberpanel_domains():
-    """Get list of domains from CyberPanel."""
     domains = []
 
     # Method 1: CyberPanel CLI
@@ -162,7 +166,7 @@ def get_cyberpanel_domains():
     except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
         pass
 
-    # Method 2: Read from CyberPanel database
+    # Method 2: CyberPanel SQLite database
     try:
         result = subprocess.run(
             ["sqlite3", "/usr/local/CyberCP/database.sqlite3",
@@ -177,42 +181,30 @@ def get_cyberpanel_domains():
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # Method 3: Read from named/PowerDNS zone files
-    zone_dir = "/etc/namedb"
-    if os.path.isdir(zone_dir):
-        for f in os.listdir(zone_dir):
-            if f.endswith(".db"):
-                domains.append(f[:-3].lower())
-
     return domains
 
 
 def sync(config):
-    """Sync CyberPanel domains with secondary DNS service."""
     local_domains = set(get_cyberpanel_domains())
     remote_zones = list_zones(config)
     remote_domains = {z["name"].rstrip("."): z for z in remote_zones}
 
-    print(f"Local domains: {len(local_domains)}")
-    print(f"Remote zones:  {len(remote_domains)}")
+    logger.info("Local domains: %d, Remote zones: %d", len(local_domains), len(remote_domains))
 
-    # Add missing
     added = 0
     for domain in sorted(local_domains - set(remote_domains.keys())):
         if add_zone(config, domain):
             added += 1
 
-    # Remove stale
     removed = 0
     for domain in sorted(set(remote_domains.keys()) - local_domains):
         if remove_zone(config, domain):
             removed += 1
 
-    print(f"\nSync complete: +{added} added, -{removed} removed")
+    logger.info("Sync complete: +%d added, -%d removed", added, removed)
 
 
 def cmd_list(config):
-    """Print zones on secondary DNS."""
     zones = list_zones(config)
     if not zones:
         print("No zones found.")
@@ -223,13 +215,66 @@ def cmd_list(config):
         print(f"{z['name']:<40} {z.get('status','?'):<10} {z.get('masterIp','?'):<18} {z.get('lastSync','never')}")
 
 
+# --- Django signal handlers (used when loaded as CyberPanel plugin) ---
+
+def on_website_created(sender, **kwargs):
+    """Django signal receiver for postWebsiteCreation."""
+    try:
+        request = kwargs.get("request")
+        if not request:
+            return
+        data = json.loads(request.body) if hasattr(request, "body") else {}
+        domain = data.get("domainName") or data.get("domain", "")
+        if not domain:
+            return
+        config = load_config()
+        if config:
+            add_zone(config, domain)
+    except Exception as e:
+        logger.error("Signal handler error (create): %s", e)
+
+
+def on_website_deleted(sender, **kwargs):
+    """Django signal receiver for postWebsiteDeletion."""
+    try:
+        request = kwargs.get("request")
+        if not request:
+            return
+        data = json.loads(request.body) if hasattr(request, "body") else {}
+        domain = data.get("websiteName") or data.get("domainName") or data.get("domain", "")
+        if not domain:
+            return
+        config = load_config()
+        if config:
+            remove_zone(config, domain)
+    except Exception as e:
+        logger.error("Signal handler error (delete): %s", e)
+
+
+def register_signals():
+    """Connect to CyberPanel Django signals."""
+    try:
+        from websiteFunctions.signals import postWebsiteCreation, postWebsiteDeletion
+        postWebsiteCreation.connect(on_website_created)
+        postWebsiteDeletion.connect(on_website_deleted)
+        logger.info("SecondDNS signals registered.")
+    except ImportError:
+        logger.warning("CyberPanel signals not available (not running inside CyberPanel).")
+
+
+# --- CLI ---
+
 def main():
+    setup_logging()
+
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
 
     cmd = sys.argv[1]
     config = load_config()
+    if not config:
+        sys.exit(1)
 
     if cmd == "add" and len(sys.argv) >= 3:
         add_zone(config, sys.argv[2])
