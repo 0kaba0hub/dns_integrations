@@ -21,9 +21,10 @@ Hosting panel integrations for secondary DNS service.
 All integrations use the same REST API:
 
 ```
-GET    /api/zones              — List zones
-POST   /api/zones              — Add zone { "name": "example.com", "masterIp": "1.2.3.4" }
-DELETE  /api/zones/{id}         — Remove zone
+GET    /api/zones                    — List zones
+POST   /api/zones                    — Add zone { "name": "example.com", "masterIp": "1.2.3.4" }
+GET    /api/zones/by-name/{name}     — Find zone by domain name
+DELETE  /api/zones/{id}               — Remove zone
 ```
 
 Authentication: `X-API-Key` header.

@@ -130,10 +130,16 @@ def add_zone(config, domain):
     return True
 
 
+def find_zone_by_name(config, domain):
+    result = api_request(config, "GET", f"/api/zones/by-name/{domain}")
+    if result and not result.get("_status"):
+        return result
+    return None
+
+
 def remove_zone(config, domain):
     domain = domain.lower().rstrip(".")
-    zones = list_zones(config)
-    zone = next((z for z in zones if z["name"].rstrip(".") == domain), None)
+    zone = find_zone_by_name(config, domain)
     if not zone:
         logger.info("[-] Zone %s not found on secondary DNS.", domain)
         return False
