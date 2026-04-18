@@ -70,25 +70,13 @@ confirm() {
         echo "[!] No interactive terminal. Use --yes to skip prompts."
         exit 1
     fi
-    read -p "$1 [y/N] " -n 1 -r < /dev/tty
+    read -p "$1 [Y/n] " -n 1 -r < /dev/tty
     echo
-    [[ $REPLY =~ ^[Yy]$ ]]
+    [[ ! $REPLY =~ ^[Nn]$ ]]
 }
 
 echo "=== SecondDNS CyberPanel Integration ==="
 echo ""
-
-# Auto-detect master IP
-if [ -z "$MASTER_IP" ]; then
-    MASTER_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || \
-                curl -sf --max-time 5 https://ifconfig.me 2>/dev/null || echo "")
-    if [ -n "$MASTER_IP" ]; then
-        echo "[+] Auto-detected master IP: $MASTER_IP"
-    else
-        echo "[!] Could not auto-detect master IP"
-        read -p "    Enter your primary DNS server IP: " MASTER_IP < /dev/tty 2>/dev/null
-    fi
-fi
 
 # Verify API key
 echo "[*] Verifying API key..."
@@ -103,6 +91,57 @@ VERIFY=$(curl -sf --max-time 10 \
     echo "    Key: ${API_KEY:0:8}..."
     exit 1
 }
+
+# Detect server IPs
+SERVER_V4=$(curl -4 -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
+SERVER_V6=$(curl -6 -sf --max-time 5 https://api64.ipify.org 2>/dev/null || echo "")
+
+# Get available secondary DNS IPs from API
+API_DNS_IPS=$(curl -sf --max-time 10 \
+    -H "X-API-Key: $API_KEY" \
+    -H "User-Agent: SecondDNS-Installer/1.0" \
+    "$API_URL/api/server-info" 2>/dev/null | \
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('dnsIps',''))" 2>/dev/null || echo "")
+
+API_HAS_V4=$(echo "$API_DNS_IPS" | tr ',' '\n' | grep -v ':' | head -1)
+API_HAS_V6=$(echo "$API_DNS_IPS" | tr ',' '\n' | grep ':' | head -1)
+
+# Intersect: offer only protocols both server and API support
+CAN_V4="" ; [ -n "$SERVER_V4" ] && [ -n "$API_HAS_V4" ] && CAN_V4=1
+CAN_V6="" ; [ -n "$SERVER_V6" ] && [ -n "$API_HAS_V6" ] && CAN_V6=1
+
+IP_PREFERENCE=""
+if [ -n "$CAN_V4" ] && [ -n "$CAN_V6" ]; then
+    echo "[+] Both protocols available:"
+    echo "    1) IPv4: server $SERVER_V4 ↔ secondary $API_HAS_V4"
+    echo "    2) IPv6: server $SERVER_V6 ↔ secondary $API_HAS_V6"
+    read -p "    Choose [1]: " -n 1 -r < /dev/tty
+    echo
+    case $REPLY in
+        2) IP_PREFERENCE="v6" ;;
+        *) IP_PREFERENCE="v4" ;;
+    esac
+elif [ -n "$CAN_V6" ]; then
+    IP_PREFERENCE="v6"
+elif [ -n "$CAN_V4" ]; then
+    IP_PREFERENCE="v4"
+fi
+
+# Set master IP based on preference
+if [ -z "$MASTER_IP" ]; then
+    if [ "$IP_PREFERENCE" = "v6" ]; then
+        MASTER_IP="$SERVER_V6"
+    elif [ "$IP_PREFERENCE" = "v4" ]; then
+        MASTER_IP="$SERVER_V4"
+    fi
+
+    if [ -n "$MASTER_IP" ]; then
+        echo "[+] Master IP: $MASTER_IP"
+    else
+        echo "[!] Could not auto-detect master IP"
+        read -p "    Enter your primary DNS server IP: " MASTER_IP < /dev/tty
+    fi
+fi
 
 # Install CLI
 echo ""
@@ -195,19 +234,21 @@ done
 if [ -n "$PDNS_CONF" ]; then
     echo "[=] Found $PDNS_CONF"
 
-    # Get secondary DNS IPs from API
-    DNS_IPS=$(curl -sf --max-time 10 \
-        -H "X-API-Key: $API_KEY" \
-        -H "User-Agent: SecondDNS-Installer/1.0" \
-        "$API_URL/api/server-info" 2>/dev/null | \
-        python3 -c "import sys,json; print(json.load(sys.stdin).get('dnsIps',''))" 2>/dev/null || echo "")
-
-    if [ -n "$DNS_IPS" ]; then
-        echo "[+] Secondary DNS IPs from API: $DNS_IPS"
+    # Use the IP matching chosen protocol
+    if [ "$IP_PREFERENCE" = "v6" ] && [ -n "$API_HAS_V6" ]; then
+        DNS_IPS="$API_HAS_V6"
+    elif [ -n "$API_HAS_V4" ]; then
+        DNS_IPS="$API_HAS_V4"
     else
-        DNS_IPS=$(grep -E "^dns_ips\s*=" "$CONFIG_FILE" 2>/dev/null | sed 's/^dns_ips\s*=\s*//' | tr -d ' ')
-        [ -z "$DNS_IPS" ] && read -p "    Enter secondary DNS IPs: " DNS_IPS < /dev/tty 2>/dev/null
+        DNS_IPS="$API_DNS_IPS"
     fi
+
+    if [ -z "$DNS_IPS" ]; then
+        DNS_IPS=$(grep -E "^dns_ips\s*=" "$CONFIG_FILE" 2>/dev/null | sed 's/^dns_ips\s*=\s*//' | tr -d ' ')
+        [ -z "$DNS_IPS" ] && read -p "    Enter secondary DNS IP: " DNS_IPS < /dev/tty
+    fi
+
+    echo "[+] Secondary DNS IP: $DNS_IPS"
 
     if [ -n "$DNS_IPS" ]; then
         ISSUES=0
@@ -255,10 +296,22 @@ else
     echo "[!] pdns.conf not found — configure AXFR manually"
 fi
 
-# Initial sync
-echo ""
-if confirm "Sync existing domains now?"; then
-    "$INSTALL_DIR/seconddns" sync
+# Initial sync — check CyberPanel domains, ask if any exist
+DOMAIN_COUNT=$(python3 -c "
+import sys; sys.path.insert(0, '/usr/local/CyberCP')
+try:
+    import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'CyberCP.settings')
+    import django; django.setup()
+    from websiteFunctions.models import Websites
+    print(Websites.objects.count())
+except: print(0)
+" 2>/dev/null || echo "0")
+
+if [ "$DOMAIN_COUNT" -gt 0 ]; then
+    echo ""
+    if confirm "Found $DOMAIN_COUNT domains. Sync to secondary DNS now?"; then
+        "$INSTALL_DIR/seconddns" sync
+    fi
 fi
 
 echo ""
